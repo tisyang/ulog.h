@@ -52,9 +52,10 @@ void ulog_printf(int level, const char *file, int line, const char *func, const 
 int  ulog_set_level(int level);
 
 enum uLogTimeFmt {
-    ULOG_TIME_LONG  = 0,
-    ULOG_TIME_SHORT = 1,
-    ULOG_TIME_MONO  = 2,
+    ULOG_TIME_LONGDATE  = 0,
+    ULOG_TIME_SHORTDATE = 1,
+    ULOG_TIME_TIMEONLY  = 2,
+    ULOG_TIME_MONO      = 3,
     ULOG_TIME__COUNT,
 };
 // set output time fmt
@@ -109,11 +110,11 @@ static pid_t ulog_get_tid(void) {
 }
 
 static const char * const LEVEL_STR[ULOG_LL__COUNT] = {
-    [ULOG_LL_DEBUG]     = "D ",
-    [ULOG_LL_INFO]      = "I ",
-    [ULOG_LL_NOTICE]    = "N ",
-    [ULOG_LL_WARNING]   = "W ",
-    [ULOG_LL_ERROR]     = "E ",
+    [ULOG_LL_DEBUG]     = "[D]",
+    [ULOG_LL_INFO]      = "[I]",
+    [ULOG_LL_NOTICE]    = "[N]",
+    [ULOG_LL_WARNING]   = "[W]",
+    [ULOG_LL_ERROR]     = "[E]",
 };
 
 static const char* const LEVEL_TERM_COLOR[] = {
@@ -155,7 +156,7 @@ struct ulog_ctx {
 };
 
 #define ULOG_DEFAULT_FLAGS \
-    (LEVEL_TO_BITS(ULOG_LL_DEBUG) | TIMEFMT_TO_BITS(ULOG_TIME_SHORT) | SRCFMT_TO_BITS(ULOG_SRC_SHORT))
+    (LEVEL_TO_BITS(ULOG_LL_DEBUG) | TIMEFMT_TO_BITS(ULOG_TIME_SHORTDATE) | SRCFMT_TO_BITS(ULOG_SRC_SHORT))
 
 static struct ulog_ctx g_ulog_ctx = {
     .tty_bits = 0,
@@ -186,7 +187,7 @@ static inline void ulog_unlock(struct ulog_ctx *ctx)
 
 int  ulog_set_level(int level)
 {
-    if (level >= ULOG_LL_DEBUG && level < ULOG_LL__COUNT) {
+    if (level >= 0 && level < ULOG_LL__COUNT) {
         unsigned expected = atomic_load(&g_ulog_ctx.flags);
         unsigned desired;
         unsigned mask = 0xF;
@@ -201,7 +202,7 @@ int  ulog_set_level(int level)
 
 int  ulog_set_timefmt(int fmt)
 {
-    if (fmt >= ULOG_TIME_LONG && fmt < ULOG_TIME__COUNT) {
+    if (fmt >= 0 && fmt < ULOG_TIME__COUNT) {
         unsigned expected = atomic_load(&g_ulog_ctx.flags);
         unsigned desired;
         unsigned mask = 0xF0;
@@ -216,7 +217,7 @@ int  ulog_set_timefmt(int fmt)
 
 int  ulog_set_srcfmt(int fmt)
 {
-    if (fmt >= ULOG_SRC_NONE && fmt < ULOG_SRC__COUNT) {
+    if (fmt >= 0 && fmt < ULOG_SRC__COUNT) {
         unsigned expected = atomic_load(&g_ulog_ctx.flags);
         unsigned desired;
         unsigned mask = 0xF00;
@@ -291,6 +292,12 @@ void ulog_flush()
     ulog_unlock(&g_ulog_ctx);
 }
 
+static const char * const TIMEFMT_FMTS[ULOG_TIME__COUNT] = {
+    [ULOG_TIME_LONGDATE]    = "%Y-%m-%d %H:%M:%S",
+    [ULOG_TIME_SHORTDATE]   = "%m/%d %H:%M:%S",
+    [ULOG_TIME_TIMEONLY]    = "%H:%M:%S",
+    [ULOG_TIME_MONO]        = "<mono>",
+};
 // core output function
 void ulog_output(int level, const char *file, int line, const char *func, const char *msg)
 {
@@ -313,13 +320,13 @@ void ulog_output(int level, const char *file, int line, const char *func, const 
     }
     switch (srcfmt) {
     case ULOG_SRC_FULL:
-        snprintf(srcbuf, sizeof(srcbuf), "%s:%s [%d]%s", file, lbuf, ulog_get_tid(), func);
+        snprintf(srcbuf, sizeof(srcbuf), " %s:%s [%d]%s", file, lbuf, ulog_get_tid(), func);
         break;
     case ULOG_SRC_LONG:
-        snprintf(srcbuf, sizeof(srcbuf), "%s:%s %s", file, lbuf, func);
+        snprintf(srcbuf, sizeof(srcbuf), " %s:%s %s", file, lbuf, func);
         break;
     case ULOG_SRC_SHORT:
-        snprintf(srcbuf, sizeof(srcbuf), "%s:%s", file, lbuf);
+        snprintf(srcbuf, sizeof(srcbuf), " %s:%s", file, lbuf);
         break;
     }
 
@@ -337,8 +344,7 @@ void ulog_output(int level, const char *file, int line, const char *func, const 
             struct tm tm_info;
             localtime_r(&ts.tv_sec, &tm_info);
             strftime(g_ulog_ctx.last_time_str, sizeof(g_ulog_ctx.last_time_str),
-                timefmt == ULOG_TIME_LONG ? "%Y-%m-%d %H:%M:%S" : "%m/%d %H:%M:%S",
-                &tm_info);
+                TIMEFMT_FMTS[timefmt], &tm_info);
         }
         g_ulog_ctx.last_sec = ts.tv_sec;
     }
