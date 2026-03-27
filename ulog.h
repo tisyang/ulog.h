@@ -382,6 +382,7 @@ void ulog_output(int level, const char *file, int line, const char *func, const 
         fputs(": ", fcur);
         fwrite(msg, 1, (msg_len > ULOG_LINEBUF_MAXSZ ? ULOG_LINEBUF_MAXSZ : msg_len), fcur);
         fputc('\n', fcur);
+        if (level >= ULOG_LL_WARNING) fflush(g_ulog_ctx.fp);;
     }
 
     ulog_unlock(&g_ulog_ctx);
