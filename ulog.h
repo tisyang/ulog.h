@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#include <stdbool.h>
+#include <stddef.h>
 
 enum uLogLevel {
     ULOG_LL_DEBUG   = 0,
@@ -34,6 +34,7 @@ enum uLogLevel {
 // return 0 OK, otherwise error
 // filepath: NULL => close output to file
 int  ulog_tofile(const char *newfile);
+char * ulog_getfile(char *buff, size_t sz);
 // get ulog current log file bytes
 // return 0 OK, otherwise error
 // *size storege filesize
@@ -98,15 +99,26 @@ int  ulog_set_srcfmt(int srcfmt);
 #  include <stdatomic.h>
 #  include <errno.h>
 #  include <string.h>
+# ifdef _WIN32
+#  include <windows.h>
+#  include <io.h>
+#  define isatty _isatty
+#  define fileno _fileno
+# else
 #  include <unistd.h>
 #  include <sys/syscall.h>
+# endif
 
-static pid_t ulog_get_tid(void) {
-    static __thread pid_t cached_tid = 0;
-    if (__builtin_expect(cached_tid == 0, 0)) {
-        cached_tid = (pid_t)syscall(SYS_gettid);
+static unsigned int ulog_get_tid(void) {
+# ifdef _WIN32
+    return (unsigned int)GetCurrentThreadId();
+# else
+    static __thread unsigned int cached_tid = 0;
+    if (cached_tid == 0) {
+        cached_tid = syscall(SYS_gettid);
     }
     return cached_tid;
+# endif
 }
 
 static const char * const LEVEL_STR[ULOG_LL__COUNT] = {
@@ -145,6 +157,7 @@ struct ulog_ctx {
                             // bit 1: stdout tty
                             // bit 2: stderr tty
     FILE    *fp;            // current fp
+    char    path[4096];     // current file path
 
     time_t  last_sec;           // last format sec
     char    last_time_str[32];  // last time str
@@ -161,6 +174,7 @@ struct ulog_ctx {
 static struct ulog_ctx g_ulog_ctx = {
     .tty_bits = 0,
     .fp = NULL,
+    .path = "",
     .flags = ULOG_DEFAULT_FLAGS,
     .write_lock = ATOMIC_FLAG_INIT,
     .last_sec = 0,
@@ -248,6 +262,20 @@ int ulog_size(long *size)
     return ret;
 }
 
+char* ulog_getfile(char *buff, size_t sz)
+{
+    char *path = NULL;
+    ulog_lock(&g_ulog_ctx);
+    if (g_ulog_ctx.fp) {
+        int ret = snprintf(buff, sz, "%s", g_ulog_ctx.path);
+        if (ret > 0 && ret < sz) {
+            path = buff;
+        }
+    }
+    ulog_unlock(&g_ulog_ctx);
+    return path;
+}
+
 int ulog_tofile(const char *newfile)
 {
     int ret = 0;
@@ -263,11 +291,14 @@ int ulog_tofile(const char *newfile)
         fflush(g_ulog_ctx.fp);
         fclose(g_ulog_ctx.fp);
         g_ulog_ctx.fp = NULL;
+        g_ulog_ctx.path[0] = '\0';
     }
 
     if (newfile) {
         g_ulog_ctx.fp = fopen(newfile, "ae");
-        if (!g_ulog_ctx.fp) {
+        if (g_ulog_ctx.fp) {
+            snprintf(g_ulog_ctx.path, sizeof(g_ulog_ctx.path), "%s", newfile);
+        } else {
             ret = errno;
         }
     }
@@ -286,10 +317,75 @@ void ulog_flush()
         fflush(g_ulog_ctx.fp);
         int fd = fileno(g_ulog_ctx.fp);
         if (fd >= 0 && !isatty(fd)) {
+#ifdef _WIN32
+            _commit(fd);
+#else
             fsync(fd);
+#endif
         }
     }
     ulog_unlock(&g_ulog_ctx);
+}
+
+static void ulog_gettime_real(struct timespec *ts)
+{
+#ifdef _WIN32
+    FILETIME ft;
+    ULARGE_INTEGER li;
+    // 获取系统时间（100ns为单位）
+    GetSystemTimeAsFileTime(&ft);
+    li.LowPart = ft.dwLowDateTime;
+    li.HighPart = ft.dwHighDateTime;
+    // 偏移量：1601-01-01 到 1970-01-01 的 100ns 数
+    unsigned __int64 epoch_offset = 116444736000000000ULL;
+    unsigned __int64 now_ticks = li.QuadPart;
+
+    if (now_ticks > epoch_offset) {
+        now_ticks -= epoch_offset;
+    } else {
+        now_ticks = 0;
+    }
+    // 1 tick = 100ns
+    // 1s = 10,000,000 ticks
+    ts->tv_sec  = (time_t)(now_ticks / 10000000ULL);
+    ts->tv_nsec = (long)((now_ticks % 10000000ULL) * 100);
+#else
+    clock_gettime(CLOCK_REALTIME, ts);
+#endif
+}
+static void ulog_gettime_mono(struct timespec *ts)
+{
+#ifdef _WIN32
+    // 频率是固定的，static 局部变量初始化在 C11 中不是线程安全的
+    // 但在 MSVC 中，static 变量初始化是线程安全的
+    static LARGE_INTEGER freq = {0};
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+    }
+
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    // 计算秒
+    ts->tv_sec = (time_t)(counter.QuadPart / freq.QuadPart);
+    // 计算纳秒：先取余再乘，防止直接乘导致的溢出
+    // 使用 long long 确保中间计算不会溢出
+    long long remainder = counter.QuadPart % freq.QuadPart;
+    ts->tv_nsec = (long)((remainder * 1000000000LL) / freq.QuadPart);
+#else
+    clock_gettime(CLOCK_MONOTONIC, ts);
+#endif
+}
+
+static inline struct tm * ulog_localtime(const time_t *timer, struct tm *tm)
+{
+#ifdef _WIN32
+    if (localtime_s(tm, timer) == 0) {
+        return tm;
+    }
+    return NULL;
+#else
+    return localtime_r(timer, tm);
+#endif
 }
 
 static const char * const TIMEFMT_FMTS[ULOG_TIME__COUNT] = {
@@ -308,7 +404,11 @@ void ulog_output(int level, const char *file, int line, const char *func, const 
 
     int timefmt = TIMEFMT_FROM_BITS(flags);
     struct timespec ts = {0};
-    clock_gettime(timefmt == ULOG_TIME_MONO ? CLOCK_MONOTONIC : CLOCK_REALTIME, &ts);
+    if (timefmt == ULOG_TIME_MONO) {
+        ulog_gettime_mono(&ts);
+    } else {
+        ulog_gettime_real(&ts);
+    }
 
     int srcfmt = SRCFMT_FROM_BITS(flags);
     char srcbuf[256] = {0};
@@ -320,7 +420,7 @@ void ulog_output(int level, const char *file, int line, const char *func, const 
     }
     switch (srcfmt) {
     case ULOG_SRC_FULL:
-        snprintf(srcbuf, sizeof(srcbuf), " %s:%s [%d]%s", file, lbuf, ulog_get_tid(), func);
+        snprintf(srcbuf, sizeof(srcbuf), " %s:%s [%u]%s", file, lbuf, ulog_get_tid(), func);
         break;
     case ULOG_SRC_LONG:
         snprintf(srcbuf, sizeof(srcbuf), " %s:%s %s", file, lbuf, func);
@@ -337,12 +437,12 @@ void ulog_output(int level, const char *file, int line, const char *func, const 
         g_ulog_ctx.tty_bits |= (!!isatty(fileno(stderr))) << 2;
     }
 
-    if (__builtin_expect(ts.tv_sec != g_ulog_ctx.last_sec, 0)) {
+    if (ts.tv_sec != g_ulog_ctx.last_sec) {
         if (timefmt == ULOG_TIME_MONO) {
             snprintf(g_ulog_ctx.last_time_str, sizeof(g_ulog_ctx.last_time_str), "%lld", (long long)ts.tv_sec);
         } else {
             struct tm tm_info;
-            localtime_r(&ts.tv_sec, &tm_info);
+            ulog_localtime(&ts.tv_sec, &tm_info);
             strftime(g_ulog_ctx.last_time_str, sizeof(g_ulog_ctx.last_time_str),
                 TIMEFMT_FMTS[timefmt], &tm_info);
         }
@@ -351,7 +451,7 @@ void ulog_output(int level, const char *file, int line, const char *func, const 
 
     FILE *fcur = (level >= ULOG_LL_ERROR) ? stderr : stdout;
     int fd_idx = (level >= ULOG_LL_ERROR) ? 2 : 1;
-    bool is_tty = (g_ulog_ctx.tty_bits >> fd_idx) & 1;
+    int is_tty = (g_ulog_ctx.tty_bits >> fd_idx) & 1;
     if (is_tty) {
         fputs(COLOR_TIME, fcur);
         // only show time on screen
@@ -382,7 +482,7 @@ void ulog_output(int level, const char *file, int line, const char *func, const 
         fputs(": ", fcur);
         fwrite(msg, 1, (msg_len > ULOG_LINEBUF_MAXSZ ? ULOG_LINEBUF_MAXSZ : msg_len), fcur);
         fputc('\n', fcur);
-        if (level >= ULOG_LL_WARNING) fflush(g_ulog_ctx.fp);;
+        if (level >= ULOG_LL_WARNING) fflush(g_ulog_ctx.fp);
     }
 
     ulog_unlock(&g_ulog_ctx);
