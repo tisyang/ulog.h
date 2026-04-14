@@ -449,12 +449,10 @@ void ulog_output(int level, const char *file, int line, const char *func, const 
         g_ulog_ctx.last_sec = ts.tv_sec;
     }
 
-    FILE *fcur = (level >= ULOG_LL_ERROR) ? stderr : stdout;
-    int fd_idx = (level >= ULOG_LL_ERROR) ? 2 : 1;
-    int is_tty = (g_ulog_ctx.tty_bits >> fd_idx) & 1;
+    FILE *fcur = stdout;
+    int is_tty = (g_ulog_ctx.tty_bits >> 1) & 1;
     if (is_tty) {
         fputs(COLOR_TIME, fcur);
-        // only show time on screen
         fputs(g_ulog_ctx.last_time_str, fcur);
         fprintf(fcur, ".%06ld ", ts.tv_nsec / 1000);
         fputs(LEVEL_TERM_COLOR[level], fcur);
